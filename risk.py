@@ -1,7 +1,8 @@
 """
-Risk guardrails. Every trade must pass through check_trade_allowed()
-before an order is sent to Robinhood. This is the single choke point -
-if you add new rules, add them here so nothing can bypass them.
+Risk guardrails, per-user. Every trade must pass through
+check_trade_allowed(user_id, amount) before an order is sent to
+Robinhood. Single choke point - add new rules here, not elsewhere,
+so nothing can bypass them.
 """
 import datetime as dt
 import time
@@ -17,16 +18,16 @@ def _today_str() -> str:
     return dt.datetime.utcnow().strftime("%Y-%m-%d")
 
 
-def check_trade_allowed(quote_amount_usd: float):
+def check_trade_allowed(user_id: int, quote_amount_usd: float):
     """Raises RiskViolation with a human-readable reason if the trade
     should be blocked. Returns None if OK."""
 
-    if storage.is_paused():
+    if storage.is_paused(user_id):
         raise RiskViolation(
             "Trading is paused (kill switch is on). Use /resume to re-enable."
         )
 
-    limits = storage.get_risk_limits()
+    limits = storage.get_risk_limits(user_id)
 
     if quote_amount_usd > limits["max_trade_usd"]:
         raise RiskViolation(
@@ -34,7 +35,7 @@ def check_trade_allowed(quote_amount_usd: float):
             f"of ${limits['max_trade_usd']:.2f}. Adjust in /settings if intended."
         )
 
-    last_trade_time = storage.get_last_trade_time()
+    last_trade_time = storage.get_last_trade_time(user_id)
     if last_trade_time is not None:
         elapsed = time.time() - last_trade_time
         cooldown = limits["cooldown_seconds"]
@@ -45,7 +46,7 @@ def check_trade_allowed(quote_amount_usd: float):
                 f"(prevents accidental rapid-fire orders)."
             )
 
-    today_loss = storage.get_realized_loss(_today_str())
+    today_loss = storage.get_realized_loss(user_id, _today_str())
     if today_loss >= limits["daily_loss_limit_usd"]:
         raise RiskViolation(
             f"Daily loss limit reached (${today_loss:.2f} / "
@@ -54,8 +55,8 @@ def check_trade_allowed(quote_amount_usd: float):
         )
 
 
-def record_realized_pnl(pnl_usd: float):
+def record_realized_pnl(user_id: int, pnl_usd: float):
     """Call after a sell fills. Pass a NEGATIVE number for a loss.
     Only losses accumulate against the daily limit."""
     if pnl_usd < 0:
-        storage.add_realized_loss(_today_str(), abs(pnl_usd))
+        storage.add_realized_loss(user_id, _today_str(), abs(pnl_usd))
