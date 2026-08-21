@@ -1,11 +1,8 @@
 """
-Persistence layer. SQLite, single file, no external DB server needed.
-Everything the bot needs to remember across restarts lives here:
-  - trade log (every order, filled or not)
-  - price alerts
-  - DCA (recurring buy) schedules
-  - risk state (daily loss tracking, pause flag)
-  - key-value settings
+Persistence layer, multi-user. Every table is keyed by telegram_user_id
+so each person's credentials, trades, alerts, and settings are isolated
+from everyone else's - this is what makes "anyone can use the bot" safe:
+no one can see or touch another user's data or account.
 """
 import json
 import sqlite3
@@ -16,8 +13,21 @@ from pathlib import Path
 DB_PATH = Path(__file__).parent / "bot.db"
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    telegram_user_id INTEGER PRIMARY KEY,
+    robinhood_api_key_enc TEXT,
+    robinhood_private_key_enc TEXT,
+    connected_at REAL,
+    dry_run INTEGER DEFAULT 1,   -- 1 = dry run (default, safe), 0 = live
+    paused INTEGER DEFAULT 0,
+    max_trade_usd REAL DEFAULT 100.0,
+    daily_loss_limit_usd REAL DEFAULT 200.0,
+    cooldown_seconds REAL DEFAULT 30
+);
+
 CREATE TABLE IF NOT EXISTS trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    telegram_user_id INTEGER,
     client_order_id TEXT UNIQUE,
     robinhood_order_id TEXT,
     symbol TEXT,
@@ -36,6 +46,7 @@ CREATE TABLE IF NOT EXISTS trades (
 
 CREATE TABLE IF NOT EXISTS alerts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    telegram_user_id INTEGER,
     symbol TEXT,
     direction TEXT,          -- 'above' | 'below'
     target_price REAL,
@@ -45,6 +56,7 @@ CREATE TABLE IF NOT EXISTS alerts (
 
 CREATE TABLE IF NOT EXISTS dca_schedules (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    telegram_user_id INTEGER,
     symbol TEXT,
     quote_amount REAL,       -- dollars per buy
     interval_hours REAL,
@@ -53,14 +65,11 @@ CREATE TABLE IF NOT EXISTS dca_schedules (
     created_at REAL
 );
 
-CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,
-    value TEXT
-);
-
 CREATE TABLE IF NOT EXISTS daily_pnl (
-    date TEXT PRIMARY KEY,   -- YYYY-MM-DD
-    realized_loss REAL DEFAULT 0
+    telegram_user_id INTEGER,
+    date TEXT,               -- YYYY-MM-DD
+    realized_loss REAL DEFAULT 0,
+    PRIMARY KEY (telegram_user_id, date)
 );
 """
 
@@ -81,58 +90,110 @@ def init_db():
         conn.executescript(SCHEMA)
 
 
-# ---------- settings (key-value) ----------
+# ---------- users / credentials ----------
 
-def get_setting(key: str, default: str | None = None) -> str | None:
-    with get_conn() as conn:
-        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
-        return row["value"] if row else default
-
-
-def set_setting(key: str, value: str):
+def upsert_user_credentials(user_id: int, api_key_enc: str, private_key_enc: str):
     with get_conn() as conn:
         conn.execute(
-            "INSERT INTO settings (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, value),
+            "INSERT INTO users (telegram_user_id, robinhood_api_key_enc, "
+            "robinhood_private_key_enc, connected_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(telegram_user_id) DO UPDATE SET "
+            "robinhood_api_key_enc = excluded.robinhood_api_key_enc, "
+            "robinhood_private_key_enc = excluded.robinhood_private_key_enc, "
+            "connected_at = excluded.connected_at",
+            (user_id, api_key_enc, private_key_enc, time.time()),
         )
 
 
-def is_paused() -> bool:
-    return get_setting("paused", "false") == "true"
+def get_user(user_id: int):
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM users WHERE telegram_user_id = ?", (user_id,)
+        ).fetchone()
 
 
-def set_paused(paused: bool):
-    set_setting("paused", "true" if paused else "false")
+def is_connected(user_id: int) -> bool:
+    u = get_user(user_id)
+    return u is not None and u["robinhood_api_key_enc"] is not None
 
 
-def is_dry_run() -> bool:
-    # Defaults to True - real trading must be explicitly enabled.
-    return get_setting("dry_run", "true") == "true"
+def disconnect_user(user_id: int):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE users SET robinhood_api_key_enc = NULL, "
+            "robinhood_private_key_enc = NULL WHERE telegram_user_id = ?",
+            (user_id,),
+        )
 
 
-def set_dry_run(dry_run: bool):
-    set_setting("dry_run", "true" if dry_run else "false")
+def _ensure_user_row(conn, user_id: int):
+    conn.execute(
+        "INSERT INTO users (telegram_user_id) VALUES (?) "
+        "ON CONFLICT(telegram_user_id) DO NOTHING",
+        (user_id,),
+    )
 
 
-def get_risk_limits() -> dict:
-    raw = get_setting("risk_limits")
-    if raw:
-        return json.loads(raw)
+# ---------- per-user mode / pause ----------
+
+def is_paused(user_id: int) -> bool:
+    u = get_user(user_id)
+    return bool(u["paused"]) if u else False
+
+
+def set_paused(user_id: int, paused: bool):
+    with get_conn() as conn:
+        _ensure_user_row(conn, user_id)
+        conn.execute(
+            "UPDATE users SET paused = ? WHERE telegram_user_id = ?",
+            (1 if paused else 0, user_id),
+        )
+
+
+def is_dry_run(user_id: int) -> bool:
+    u = get_user(user_id)
+    return bool(u["dry_run"]) if u else True  # default: safe
+
+
+def set_dry_run(user_id: int, dry_run: bool):
+    with get_conn() as conn:
+        _ensure_user_row(conn, user_id)
+        conn.execute(
+            "UPDATE users SET dry_run = ? WHERE telegram_user_id = ?",
+            (1 if dry_run else 0, user_id),
+        )
+
+
+def get_risk_limits(user_id: int) -> dict:
+    u = get_user(user_id)
+    if u is None:
+        return {"max_trade_usd": 100.0, "daily_loss_limit_usd": 200.0, "cooldown_seconds": 30}
     return {
-        "max_trade_usd": 100.0,
-        "daily_loss_limit_usd": 200.0,
-        "cooldown_seconds": 30,
+        "max_trade_usd": u["max_trade_usd"],
+        "daily_loss_limit_usd": u["daily_loss_limit_usd"],
+        "cooldown_seconds": u["cooldown_seconds"],
     }
 
 
-def set_risk_limits(limits: dict):
-    set_setting("risk_limits", json.dumps(limits))
+def set_risk_limits(user_id: int, limits: dict):
+    with get_conn() as conn:
+        _ensure_user_row(conn, user_id)
+        conn.execute(
+            "UPDATE users SET max_trade_usd = ?, daily_loss_limit_usd = ?, "
+            "cooldown_seconds = ? WHERE telegram_user_id = ?",
+            (
+                limits["max_trade_usd"],
+                limits["daily_loss_limit_usd"],
+                limits["cooldown_seconds"],
+                user_id,
+            ),
+        )
 
 
 # ---------- trades ----------
 
-def record_trade(**fields) -> int:
+def record_trade(user_id: int, **fields) -> int:
+    fields["telegram_user_id"] = user_id
     fields.setdefault("created_at", time.time())
     fields["updated_at"] = time.time()
     cols = ", ".join(fields.keys())
@@ -155,36 +216,44 @@ def update_trade_status(client_order_id: str, **fields):
         )
 
 
-def get_recent_trades(limit: int = 10) -> list:
+def get_recent_trades(user_id: int, limit: int = 10) -> list:
     with get_conn() as conn:
         return conn.execute(
-            "SELECT * FROM trades ORDER BY created_at DESC LIMIT ?", (limit,)
+            "SELECT * FROM trades WHERE telegram_user_id = ? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (user_id, limit),
         ).fetchall()
 
 
-def get_last_trade_time():
+def get_last_trade_time(user_id: int):
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT MAX(created_at) as t FROM trades"
+            "SELECT MAX(created_at) as t FROM trades WHERE telegram_user_id = ?",
+            (user_id,),
         ).fetchone()
         return row["t"] if row and row["t"] else None
 
 
 # ---------- alerts ----------
 
-def add_alert(symbol: str, direction: str, target_price: float) -> int:
+def add_alert(user_id: int, symbol: str, direction: str, target_price: float) -> int:
     with get_conn() as conn:
         cur = conn.execute(
-            "INSERT INTO alerts (symbol, direction, target_price, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (symbol, direction, target_price, time.time()),
+            "INSERT INTO alerts (telegram_user_id, symbol, direction, "
+            "target_price, created_at) VALUES (?, ?, ?, ?, ?)",
+            (user_id, symbol, direction, target_price, time.time()),
         )
         return cur.lastrowid
 
 
-def get_active_alerts() -> list:
+def get_active_alerts(user_id=None) -> list:
     with get_conn() as conn:
-        return conn.execute("SELECT * FROM alerts WHERE active = 1").fetchall()
+        if user_id is None:
+            return conn.execute("SELECT * FROM alerts WHERE active = 1").fetchall()
+        return conn.execute(
+            "SELECT * FROM alerts WHERE active = 1 AND telegram_user_id = ?",
+            (user_id,),
+        ).fetchall()
 
 
 def deactivate_alert(alert_id: int):
@@ -192,27 +261,36 @@ def deactivate_alert(alert_id: int):
         conn.execute("UPDATE alerts SET active = 0 WHERE id = ?", (alert_id,))
 
 
-def delete_alert(alert_id: int):
+def delete_alert(alert_id: int, user_id: int):
+    """user_id required so one user can't delete another user's alert by guessing an id."""
     with get_conn() as conn:
-        conn.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
+        conn.execute(
+            "DELETE FROM alerts WHERE id = ? AND telegram_user_id = ?",
+            (alert_id, user_id),
+        )
 
 
 # ---------- DCA schedules ----------
 
-def add_dca_schedule(symbol: str, quote_amount: float, interval_hours: float) -> int:
+def add_dca_schedule(user_id: int, symbol: str, quote_amount: float, interval_hours: float) -> int:
     next_run = time.time() + interval_hours * 3600
     with get_conn() as conn:
         cur = conn.execute(
-            "INSERT INTO dca_schedules (symbol, quote_amount, interval_hours, "
-            "next_run_at, created_at) VALUES (?, ?, ?, ?, ?)",
-            (symbol, quote_amount, interval_hours, next_run, time.time()),
+            "INSERT INTO dca_schedules (telegram_user_id, symbol, quote_amount, "
+            "interval_hours, next_run_at, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, symbol, quote_amount, interval_hours, next_run, time.time()),
         )
         return cur.lastrowid
 
 
-def get_active_dca_schedules() -> list:
+def get_active_dca_schedules(user_id=None) -> list:
     with get_conn() as conn:
-        return conn.execute("SELECT * FROM dca_schedules WHERE active = 1").fetchall()
+        if user_id is None:
+            return conn.execute("SELECT * FROM dca_schedules WHERE active = 1").fetchall()
+        return conn.execute(
+            "SELECT * FROM dca_schedules WHERE active = 1 AND telegram_user_id = ?",
+            (user_id,),
+        ).fetchall()
 
 
 def update_dca_next_run(schedule_id: int, next_run_at: float):
@@ -223,26 +301,31 @@ def update_dca_next_run(schedule_id: int, next_run_at: float):
         )
 
 
-def deactivate_dca_schedule(schedule_id: int):
+def deactivate_dca_schedule(schedule_id: int, user_id: int):
     with get_conn() as conn:
-        conn.execute("UPDATE dca_schedules SET active = 0 WHERE id = ?", (schedule_id,))
+        conn.execute(
+            "UPDATE dca_schedules SET active = 0 WHERE id = ? AND telegram_user_id = ?",
+            (schedule_id, user_id),
+        )
 
 
 # ---------- daily loss tracking ----------
 
-def add_realized_loss(date_str: str, amount: float):
+def add_realized_loss(user_id: int, date_str: str, amount: float):
     """amount should be positive when it represents a loss."""
     with get_conn() as conn:
         conn.execute(
-            "INSERT INTO daily_pnl (date, realized_loss) VALUES (?, ?) "
-            "ON CONFLICT(date) DO UPDATE SET realized_loss = realized_loss + excluded.realized_loss",
-            (date_str, amount),
+            "INSERT INTO daily_pnl (telegram_user_id, date, realized_loss) "
+            "VALUES (?, ?, ?) ON CONFLICT(telegram_user_id, date) "
+            "DO UPDATE SET realized_loss = realized_loss + excluded.realized_loss",
+            (user_id, date_str, amount),
         )
 
 
-def get_realized_loss(date_str: str) -> float:
+def get_realized_loss(user_id: int, date_str: str) -> float:
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT realized_loss FROM daily_pnl WHERE date = ?", (date_str,)
+            "SELECT realized_loss FROM daily_pnl WHERE telegram_user_id = ? AND date = ?",
+            (user_id, date_str),
         ).fetchone()
         return row["realized_loss"] if row else 0.0
